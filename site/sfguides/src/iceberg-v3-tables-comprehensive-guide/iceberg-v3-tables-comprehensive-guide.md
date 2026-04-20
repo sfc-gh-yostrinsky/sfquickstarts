@@ -614,10 +614,6 @@ ORDER BY EVENT_TIMESTAMP DESC
 LIMIT 20;
 ```
 
-### Deletion Vectors Overview
-
-
-
 <!-- ------------------------ -->
 ## Security and Governance
 
