@@ -521,6 +521,7 @@ DEFINE DYNAMIC TABLE dcm_demo_2_finance{{env_suffix}}.silver.finwire_cmp_stg
 TARGET_LAG='DOWNSTREAM'
 WAREHOUSE='dcm_demo_2_finance_wh{{env_suffix}}'
 DATA_METRIC_SCHEDULE = 'TRIGGER_ON_CHANGES'
+INITIALIZE = ON_SCHEDULE
 AS
 SELECT
     TO_TIMESTAMP_NTZ(pts,'YYYYMMDD-HH24MISS') AS pts,
@@ -552,7 +553,7 @@ The silver layer includes several types of transformations:
 - **Sparse value fill-forward** — `customer_ods` and `account_ods` use `LAG() IGNORE NULLS` to carry forward non-null values from prior CDC records
 - **Dimension and fact tables** — `dim_trade`, `dim_account`, `dim_date`, and others join and reshape data for the gold layer
 
-All Dynamic Tables use `TARGET_LAG='DOWNSTREAM'`, meaning they refresh only when a downstream table needs them — keeping compute costs low.
+All Dynamic Tables use `TARGET_LAG='DOWNSTREAM'`, meaning they refresh only when a downstream table needs them — keeping compute costs low. They also use `INITIALIZE = ON_SCHEDULE`, which prevents them from refreshing immediately on creation. This keeps deployments fast and predictable.
 
 #### Gold Layer
 
@@ -565,6 +566,7 @@ DEFINE DYNAMIC TABLE dcm_demo_2_finance{{env_suffix}}.gold.fact_market_history
 TARGET_LAG='2 hours'
 WAREHOUSE='dcm_demo_2_finance_wh{{env_suffix}}'
 DATA_METRIC_SCHEDULE = 'TRIGGER_ON_CHANGES'
+INITIALIZE = ON_SCHEDULE
 AS
 SELECT
     fmht.sk_security_id,
@@ -679,18 +681,25 @@ EXECUTE DCM PROJECT dcm_demo_2_finance_dev.projects.finance_pipeline DEPLOY
 
 Once the deployment completes, refresh the Database Explorer. You should see the `SILVER` and `GOLD` schemas inside `DCM_DEMO_2_FINANCE_DEV`, each populated with Dynamic Tables and views.
 
-> **Note:** By default, Dynamic Tables refresh immediately on creation. If the raw tables already contain data (from the load Task in the previous step), the deployment will take longer because each Dynamic Table performs its initial refresh during the deploy. With the sample datasets in this guide, the extra time is minimal — but in production scenarios with large datasets, be intentional about this behavior to avoid long-running deployments.
+All Dynamic Tables in this project use `INITIALIZE = ON_SCHEDULE`, which prevents them from refreshing immediately on creation. This keeps the deployment fast and predictable — especially important in production scenarios with large datasets. You'll trigger the initial refresh manually in the next step using `REFRESH ALL`.
 
 <!-- ------------------------ -->
 ## Query the Results
 
-With both projects deployed and data loaded, the Dynamic Tables will begin refreshing. Open `scripts/04_query_results.sql` in a Snowsight worksheet and run the queries to verify the end-to-end pipeline is working.
+With both projects deployed and data loaded, the Dynamic Tables are ready but haven't refreshed yet (they were created with `INITIALIZE = ON_SCHEDULE`). Open `scripts/04_query_results.sql` in a Snowsight worksheet and run the queries to trigger a refresh and verify the end-to-end pipeline.
 
-### Query Fact Tables
+### Refresh All Dynamic Tables
+
+Since the Dynamic Tables were deployed with `INITIALIZE = ON_SCHEDULE`, they won't refresh until their scheduled lag interval triggers. Use `REFRESH ALL` to kick off the initial refresh immediately:
 
 ```sql
-SELECT * FROM dcm_demo_2_finance_dev.gold.fact_market_history LIMIT 10;
+USE ROLE dcm_demo_2_finance_dev_admin;
+EXECUTE DCM PROJECT dcm_demo_2_finance_dev.projects.finance_pipeline REFRESH ALL;
 ```
+
+This triggers a refresh of every Dynamic Table managed by the Pipeline project. The refresh follows the dependency graph — silver-layer tables refresh first, then gold-layer tables that depend on them. Allow a minute or so for the refresh to complete before querying.
+
+### Query Fact Tables
 
 ```sql
 SELECT * FROM dcm_demo_2_finance_dev.gold.fact_prospect LIMIT 10;
@@ -716,7 +725,26 @@ FROM TABLE(dcm_demo_2_finance_dev.INFORMATION_SCHEMA.DATA_METRIC_FUNCTION_REFERE
 ));
 ```
 
-This shows all attached expectations and their current status. The `no_missing_id`, `no_dead_prospects`, and `no_kids` expectations should all be passing if the sample data is clean.
+This shows all attached expectations and their current status.
+
+### Run All Expectations
+
+While `DATA_METRIC_FUNCTION_REFERENCES` shows *which* monitors are attached, `TEST ALL` actually *runs* them and evaluates the results against the expectation expressions:
+
+```sql
+USE ROLE dcm_demo_2_finance_dev_admin;
+EXECUTE DCM PROJECT dcm_demo_2_finance_dev.projects.finance_pipeline TEST ALL;
+```
+
+The result is a JSON object with the status and per-expectation details — the actual metric value, the expression, and whether it was violated. You should see:
+
+| Expectation | Value | Expression | Violated |
+|:---|:---|:---|:---|
+| `no_dead_prospects` | 100 | `value < 120` | false |
+| `no_kids` | 0 | `value > 18` | **true** |
+| `no_missing_id` | 0 | `value = 0` | false |
+
+The overall status is **FAILED** because `no_kids` is violated — some prospects in the sample data have `age = 0` (missing values stored as zero). This is intentional: it shows how expectations surface data quality issues that you'd otherwise miss.
 
 <!-- ------------------------ -->
 ## Cleanup
